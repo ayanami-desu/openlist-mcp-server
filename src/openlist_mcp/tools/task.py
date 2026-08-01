@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
+from collections.abc import Mapping
+from typing import Any
 
 from mcp.server.mcpserver import MCPServer as FastMCP
 
 from ..client import get_client
-from . import enforce_writable, validate_pagination
+from . import compact_json, enforce_writable, first_present, list_value, validate_pagination
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,35 @@ def _task_params(task_id: str) -> dict[str, str]:
     return {"tid": task_id}
 
 
+def _compact_task(
+    data: Mapping[str, Any],
+    task_type: str,
+    fallback_id: str = "",
+    include_task_type: bool = False,
+) -> dict[str, Any]:
+    """Project a task record to the stable task summary shape."""
+    result: dict[str, Any] = {}
+    aliases = (
+        ("task_id", ("task_id", "tid", "id")),
+        ("name", ("name", "title")),
+        ("status", ("status", "state")),
+        ("progress", ("progress", "percent")),
+        ("path", ("path", "dst_path")),
+        ("error", ("error", "error_message")),
+        ("created_at", ("created_at", "created")),
+        ("updated_at", ("updated_at", "updated")),
+    )
+    for output, fields in aliases:
+        value = first_present(data, fields)
+        if value is not None:
+            result[output] = value
+    if "task_id" not in result and fallback_id:
+        result["task_id"] = fallback_id
+    if include_task_type:
+        result["task_type"] = task_type
+    return result
+
+
 def register_task_tools(mcp: FastMCP) -> None:
     """Register task management MCP tools."""
 
@@ -69,8 +99,9 @@ def register_task_tools(mcp: FastMCP) -> None:
             per_page: Page size for deployments that support pagination.
 
         Returns:
-            JSON string with task list data. When task_type="all", results from
-            all categories are merged with a "task_type" label on each entry.
+            JSON string with task_type, status, page, per_page, total, and tasks.
+            All-task responses flatten the six categories and include task_type
+            on each task, plus errors only for failed categories.
         """
 
         task_type = _validate_task_type(task_type)
@@ -84,8 +115,8 @@ def register_task_tools(mcp: FastMCP) -> None:
         client = await get_client()
 
         if task_type == _ALL_TASK_TYPES:
-            # Query all categories concurrently
-            async def _fetch_one(t: str) -> dict:
+
+            async def _fetch_one(t: str) -> dict[str, Any]:
                 try:
                     data = await client.request(
                         "GET",
@@ -95,34 +126,53 @@ def register_task_tools(mcp: FastMCP) -> None:
                 except Exception as exc:
                     logger.warning("list_tasks(all): %s returned error: %s", t, exc)
                     return {"task_type": t, "error": str(exc), "tasks": []}
-                tasks = data.get("value", data.get("tasks", data))
-                if isinstance(tasks, dict):
-                    tasks = [tasks]
-                if not isinstance(tasks, list):
-                    tasks = []
-                for task_entry in tasks:
-                    if isinstance(task_entry, dict):
-                        task_entry["_task_type"] = t
+                raw_tasks = list_value(data, ("value", "tasks", "content"))
+                tasks = [
+                    _compact_task(item, t, include_task_type=True)
+                    for item in raw_tasks
+                    if isinstance(item, Mapping)
+                ]
                 return {"task_type": t, "tasks": tasks}
 
             results = await asyncio.gather(*[_fetch_one(t) for t in sorted(TASK_TYPES)])
-            return json.dumps(
-                {
-                    "task_type": "all",
-                    "results": results,
-                    "total": sum(len(r["tasks"]) for r in results),
-                },
-                indent=2,
-                ensure_ascii=False,
-            )
+            tasks = [task for result in results for task in result["tasks"]]
+            errors = [
+                {"task_type": result["task_type"], "error": result["error"]}
+                for result in results
+                if "error" in result
+            ]
+            output: dict[str, Any] = {
+                "task_type": "all",
+                "status": status,
+                "page": page,
+                "per_page": per_page,
+                "total": len(tasks),
+                "tasks": tasks,
+            }
+            if errors:
+                output["errors"] = errors
+            return compact_json(output)
 
-        # Single task type
         data = await client.request(
             "GET",
             f"task/{task_type}/{status}",
             params={"page": page, "per_page": per_page},
         )
-        return json.dumps(data, indent=2, ensure_ascii=False)
+        raw_tasks = list_value(data, ("value", "tasks", "content"))
+        tasks = [_compact_task(item, task_type) for item in raw_tasks if isinstance(item, Mapping)]
+        total = data.get("total") if isinstance(data, Mapping) else None
+        if not isinstance(total, int) or isinstance(total, bool):
+            total = len(tasks)
+        return compact_json(
+            {
+                "task_type": task_type,
+                "status": status,
+                "page": page,
+                "per_page": per_page,
+                "total": total,
+                "tasks": tasks,
+            }
+        )
 
     @mcp.tool()
     async def get_task_info(
@@ -136,16 +186,23 @@ def register_task_tools(mcp: FastMCP) -> None:
             task_type: Task category, e.g. offline_download, upload, copy.
 
         Returns:
-            JSON string with task details.
+            JSON string with task_id, task_type, and compact task details.
         """
         task_type = _validate_task_type(task_type)
+        task_id = task_id.strip()
         client = await get_client()
         data = await client.request(
             "POST",
             f"task/{task_type}/info",
             params=_task_params(task_id),
         )
-        return json.dumps(data, indent=2, ensure_ascii=False)
+        task = _compact_task(
+            data if isinstance(data, Mapping) else {},
+            task_type,
+            fallback_id=task_id,
+            include_task_type=True,
+        )
+        return compact_json(task)
 
     @mcp.tool()
     async def delete_task(

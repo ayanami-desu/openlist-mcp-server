@@ -7,12 +7,62 @@ All destructive write operations require confirm=true for safety.
 
 from __future__ import annotations
 
-import json
+from collections.abc import Mapping
+from typing import Any
 
 from mcp.server.mcpserver import MCPServer as FastMCP
 
 from ..client import get_client
-from . import enforce_writable, validate_pagination
+from . import (
+    compact_fields,
+    compact_json,
+    compact_user,
+    enforce_writable,
+    first_present,
+    list_value,
+    validate_pagination,
+)
+
+
+def _compact_storage(data: Mapping[str, Any], *, include_details: bool = False) -> dict[str, Any]:
+    """Project storage metadata without provider configuration details."""
+    result: dict[str, Any] = {}
+    for output, fields in (
+        ("id", ("id",)),
+        ("mount_path", ("mount_path",)),
+        ("driver", ("driver",)),
+        ("status", ("status",)),
+        ("enabled", ("enabled", "enable")),
+        ("total", ("total",)),
+        ("free", ("free",)),
+    ):
+        value = first_present(data, fields)
+        if value is not None:
+            result[output] = value
+    if include_details:
+        for field in ("remark", "description"):
+            value = first_present(data, (field,))
+            if value is not None:
+                result[field] = value
+    return result
+
+
+def _compact_meta(data: Mapping[str, Any]) -> dict[str, Any]:
+    """Project directory metadata while exposing only sensitive-field state."""
+    result: dict[str, Any] = {}
+    for field in ("id", "path", "enabled", "write", "hide"):
+        value = first_present(data, (field,))
+        if value is not None:
+            result[field] = value
+    password_protected = False
+    for field in ("password_protected", "has_password", "pwd"):
+        if field in data:
+            password_protected = bool(data[field])
+            break
+    result["password_protected"] = password_protected
+    result["readme_present"] = bool(data.get("readme"))
+    result["header_present"] = bool(data.get("header"))
+    return result
 
 
 def register_admin_tools(mcp: FastMCP) -> None:
@@ -28,11 +78,14 @@ def register_admin_tools(mcp: FastMCP) -> None:
         status, total space, and free space. Read-only — no modification.
 
         Returns:
-            JSON string with storage list.
+            JSON string with a storages array containing id, mount_path, driver,
+            status, enabled, total, and free.
         """
         client = await get_client()
         data = await client.request("GET", "admin/storage/list")
-        return json.dumps(data, indent=2, ensure_ascii=False)
+        items = list_value(data, ("value", "storages", "content"))
+        storages = [_compact_storage(item) for item in items if isinstance(item, Mapping)]
+        return compact_json({"storages": storages})
 
     @mcp.tool()
     async def get_storage_info(storage_id: int) -> str:
@@ -43,11 +96,13 @@ def register_admin_tools(mcp: FastMCP) -> None:
                        to see available IDs.
 
         Returns:
-            JSON string with storage details.
+            JSON string with compact storage details and optional remark/description.
         """
         client = await get_client()
         data = await client.request("GET", "admin/storage/get", params={"id": storage_id})
-        return json.dumps(data, indent=2, ensure_ascii=False)
+        return compact_json(
+            _compact_storage(data, include_details=True) if isinstance(data, Mapping) else {}
+        )
 
     # ─────────────────────────── Driver (read-only) ────────────────────────────
 
@@ -59,11 +114,27 @@ def register_admin_tools(mcp: FastMCP) -> None:
         **************, etc.).
 
         Returns:
-            JSON list of driver names.
+            JSON object with the stable, de-duplicated driver names.
         """
         client = await get_client()
         data = await client.request("GET", "admin/driver/names")
-        return json.dumps(data, indent=2, ensure_ascii=False)
+        drivers: list[str] = []
+        seen: set[str] = set()
+        items = list_value(data, ("drivers", "value", "content"))
+        if not items and isinstance(data, Mapping) and isinstance(data.get("name"), str):
+            items = [data]
+        for item in items:
+            name = (
+                item
+                if isinstance(item, str)
+                else item.get("name")
+                if isinstance(item, Mapping)
+                else None
+            )
+            if isinstance(name, str) and name.strip() and name not in seen:
+                seen.add(name)
+                drivers.append(name)
+        return compact_json({"drivers": drivers})
 
     @mcp.tool()
     async def get_driver_info(driver: str) -> str:
@@ -80,7 +151,7 @@ def register_admin_tools(mcp: FastMCP) -> None:
         """
         client = await get_client()
         data = await client.request("GET", "admin/driver/info", params={"driver": driver})
-        return json.dumps(data, indent=2, ensure_ascii=False)
+        return compact_json(data)
 
     @mcp.tool()
     async def list_drivers_detail() -> str:
@@ -95,7 +166,7 @@ def register_admin_tools(mcp: FastMCP) -> None:
         """
         client = await get_client()
         data = await client.request("GET", "admin/driver/list")
-        return json.dumps(data, indent=2, ensure_ascii=False)
+        return compact_json(data)
 
     # ─────────────────────────── Settings (read + write) ───────────────────────
 
@@ -107,11 +178,37 @@ def register_admin_tools(mcp: FastMCP) -> None:
         pagination settings, preview options, etc. Read-only.
 
         Returns:
-            JSON string with all settings.
+            JSON object with sorted setting keys and their total count.
         """
         client = await get_client()
         data = await client.request("GET", "admin/setting/list")
-        return json.dumps(data, indent=2, ensure_ascii=False)
+        list_container: list[Any] | None = None
+        mapping_container: Mapping[str, Any] | None = None
+        if isinstance(data, Mapping):
+            for field in ("value", "content"):
+                candidate = data.get(field)
+                if isinstance(candidate, list):
+                    list_container = candidate
+                    break
+                if mapping_container is None and isinstance(candidate, Mapping):
+                    mapping_container = candidate
+        if list_container is not None:
+            keys = [
+                item["key"]
+                for item in list_container
+                if isinstance(item, Mapping)
+                and isinstance(item.get("key"), str)
+                and item["key"].strip()
+            ]
+        else:
+            source = mapping_container if mapping_container is not None else data
+            keys = (
+                [key for key in source if isinstance(key, str) and key.strip()]
+                if isinstance(source, Mapping)
+                else []
+            )
+        keys = sorted(set(keys))
+        return compact_json({"keys": keys, "total": len(keys)})
 
     @mcp.tool()
     async def get_setting(key: str) -> str:
@@ -122,11 +219,11 @@ def register_admin_tools(mcp: FastMCP) -> None:
                 "logo", "favicon"). Use get_settings to see all keys.
 
         Returns:
-            JSON string with the setting value.
+            Compact JSON with the setting response.
         """
         client = await get_client()
         data = await client.request("GET", "admin/setting/get", params={"key": key})
-        return json.dumps(data, indent=2, ensure_ascii=False)
+        return compact_json(data)
 
     @mcp.tool()
     async def save_settings(
@@ -195,11 +292,13 @@ def register_admin_tools(mcp: FastMCP) -> None:
         Useful for determining whether search results are up to date.
 
         Returns:
-            JSON string with index progress info.
+            JSON object containing only status, progress, total, completed, and error.
         """
         client = await get_client()
         data = await client.request("GET", "admin/index/progress")
-        return json.dumps(data, indent=2, ensure_ascii=False)
+        return compact_json(
+            compact_fields(data, ("status", "progress", "total", "completed", "error"))
+        )
 
     @mcp.tool()
     async def build_search_index(confirm: bool = False) -> str:
@@ -315,7 +414,7 @@ def register_admin_tools(mcp: FastMCP) -> None:
             per_page: Number of items per page. Defaults to 30.
 
         Returns:
-            JSON string with user list including id, username, role, etc.
+            JSON string with page, per_page, total, and compact users.
         """
         validate_pagination(page, per_page, max_per_page=200)
         client = await get_client()
@@ -324,7 +423,12 @@ def register_admin_tools(mcp: FastMCP) -> None:
             "admin/user/list",
             params={"page": page, "per_page": per_page},
         )
-        return json.dumps(data, indent=2, ensure_ascii=False)
+        items = list_value(data, ("value", "users", "content"))
+        users = [compact_user(item) for item in items if isinstance(item, Mapping)]
+        total = data.get("total") if isinstance(data, Mapping) else None
+        if not isinstance(total, int) or isinstance(total, bool):
+            total = len(users)
+        return compact_json({"page": page, "per_page": per_page, "total": total, "users": users})
 
     @mcp.tool()
     async def get_user(user_id: int) -> str:
@@ -338,11 +442,11 @@ def register_admin_tools(mcp: FastMCP) -> None:
                     to see available user IDs.
 
         Returns:
-            JSON string with user details.
+            JSON string with the compact user summary.
         """
         client = await get_client()
         data = await client.request("GET", "admin/user/get", params={"id": user_id})
-        return json.dumps(data, indent=2, ensure_ascii=False)
+        return compact_json(compact_user(data) if isinstance(data, Mapping) else {})
 
     # ─────────────────────────── Meta Management ───────────────────────────────
 
@@ -350,15 +454,20 @@ def register_admin_tools(mcp: FastMCP) -> None:
     async def list_metas() -> str:
         """List all metadata configurations on the server (Admin only).
 
-        Returns all directory-level metadata such as password protection,
-        readme text, header content, and visibility settings.
+        Returns only metadata identifiers, visibility flags, and boolean presence
+        indicators for passwords, readme, and header content.
 
         Returns:
-            JSON array of metadata configurations.
+            JSON array wrapper containing compact metadata projections.
         """
         client = await get_client()
         data = await client.request("GET", "admin/meta/list")
-        return json.dumps(data, indent=2, ensure_ascii=False)
+        metas = [
+            _compact_meta(item)
+            for item in list_value(data, ("value", "metas", "content"))
+            if isinstance(item, Mapping)
+        ]
+        return compact_json({"metas": metas})
 
     @mcp.tool()
     async def get_meta(meta_id: int) -> str:
@@ -369,11 +478,11 @@ def register_admin_tools(mcp: FastMCP) -> None:
                     to see available IDs.
 
         Returns:
-            JSON string with metadata configuration.
+            JSON string with the compact metadata projection.
         """
         client = await get_client()
         data = await client.request("GET", "admin/meta/get", params={"id": meta_id})
-        return json.dumps(data, indent=2, ensure_ascii=False)
+        return compact_json(_compact_meta(data) if isinstance(data, Mapping) else {})
 
     # ─────────────────────────── Token Management ──────────────────────────────
 
@@ -397,6 +506,5 @@ def register_admin_tools(mcp: FastMCP) -> None:
             )
         enforce_writable("reset_api_token")
         client = await get_client()
-        data = await client.request("POST", "admin/setting/reset_token")
-        result = json.dumps(data, indent=2, ensure_ascii=False)
-        return f"API token reset successfully. Result: {result}"
+        await client.request("POST", "admin/setting/reset_token")
+        return "API token reset successfully."

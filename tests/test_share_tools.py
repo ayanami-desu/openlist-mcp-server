@@ -1,5 +1,6 @@
 """Behavior tests for share management MCP tools."""
 
+import orjson
 import pytest
 
 
@@ -59,6 +60,86 @@ async def test_update_share_sends_id_and_files(share_tools) -> None:
             },
         ),
     ]
+
+
+@pytest.mark.asyncio
+async def test_create_share_projects_only_safe_fields(share_tools) -> None:
+    tools, client = share_tools
+    client.responses["POST", "share/create"] = {
+        "id": "share-1",
+        "url": "https://share.invalid/1",
+        "expires": "2026-12-31",
+        "pwd": "secret",
+        "password": "secret",
+        "files": ["/docs/report.pdf"],
+        "enabled": True,
+        "max_accessed": 9,
+        "remark": "drop",
+    }
+
+    result = await tools["create_share"](files=["/docs/report.pdf"], pwd="secret")
+
+    assert orjson.loads(result) == {
+        "share_id": "share-1",
+        "share_url": "https://share.invalid/1",
+        "expires": "2026-12-31",
+        "password_protected": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_list_and_get_share_project_password_and_files(share_tools) -> None:
+    tools, client = share_tools
+    client.responses["GET", "share/list"] = {
+        "value": [
+            {
+                "id": "share-1",
+                "enabled": False,
+                "expires": "2026-12-31",
+                "has_password": True,
+                "max_access": 5,
+                "access_count": 2,
+                "remark": "docs",
+                "pwd": "secret",
+                "files": ["/docs/report.pdf"],
+            }
+        ],
+        "total": 9,
+    }
+    client.responses["GET", "share/get"] = {
+        "share_id": "share-1",
+        "share_url": "https://share.invalid/1",
+        "password_protected": True,
+        "pwd": "secret",
+        "files": ["/docs/report.pdf", {"path": "/docs/summary.csv"}, {"secret": "drop"}],
+        "token": "drop",
+    }
+
+    listed = await tools["list_shares"](page=2, per_page=10)
+    detail = await tools["get_share_info"]("share-1")
+
+    assert orjson.loads(listed) == {
+        "page": 2,
+        "per_page": 10,
+        "total": 9,
+        "shares": [
+            {
+                "share_id": "share-1",
+                "enabled": False,
+                "expires": "2026-12-31",
+                "password_protected": True,
+                "max_accessed": 5,
+                "accessed": 2,
+                "remark": "docs",
+            }
+        ],
+    }
+    assert orjson.loads(detail) == {
+        "share_id": "share-1",
+        "share_url": "https://share.invalid/1",
+        "password_protected": True,
+        "files": ["/docs/report.pdf", "/docs/summary.csv"],
+    }
 
 
 @pytest.mark.asyncio

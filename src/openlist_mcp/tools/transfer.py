@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
-import json
 import os
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -13,7 +12,7 @@ from pathlib import Path
 from mcp.server.mcpserver import MCPServer as FastMCP
 
 from ..client import get_client
-from . import enforce_path_allowed, enforce_writable, validate_name
+from . import compact_json, enforce_path_allowed, enforce_writable, validate_name
 
 # Maximum base64 content length for upload_file (~75MB raw, ~100MB base64).
 # For larger files, use upload_local_file which streams from disk.
@@ -59,8 +58,7 @@ def register_transfer_tools(mcp: FastMCP) -> None:
             path: Full path to the file.
             password: Password if the path is password-protected. Defaults to "".
 
-        Returns:
-            The download URL for the file, or file info with raw_url.
+            JSON object with download_url and path, or a compact error object.
         """
         enforce_path_allowed(path)
         client = await get_client()
@@ -71,12 +69,8 @@ def register_transfer_tools(mcp: FastMCP) -> None:
         )
         raw_url = data.get("raw_url", "")
         if raw_url:
-            return json.dumps(
-                {"download_url": raw_url, "path": path},
-                indent=2,
-                ensure_ascii=False,
-            )
-        return json.dumps(data, indent=2, ensure_ascii=False)
+            return compact_json({"download_url": raw_url, "path": path})
+        return compact_json({"ok": False, "path": path, "error": "No download URL available."})
 
     @mcp.tool()
     async def upload_file(
@@ -94,7 +88,7 @@ def register_transfer_tools(mcp: FastMCP) -> None:
             as_task: Process as async task for large files. Defaults to True.
 
         Returns:
-            Success message or task ID for async uploads.
+            Success message with the uploaded remote path.
         """
         enforce_path_allowed(path)
         enforce_writable("upload_file")
@@ -114,14 +108,12 @@ def register_transfer_tools(mcp: FastMCP) -> None:
         except (ValueError, binascii.Error) as e:
             return f"Failed to decode base64 content: {e}"
 
-        data = await client.upload(
+        await client.upload(
             path=path,
             file_content=file_bytes,
             file_name=file_name,
             as_task=as_task,
         )
-        if data is not None and data != {}:
-            return f"Upload task created: {json.dumps(data, ensure_ascii=False)}"
         return f"File uploaded successfully: {path}/{file_name}"
 
     @mcp.tool()
@@ -145,8 +137,7 @@ def register_transfer_tools(mcp: FastMCP) -> None:
             remote_name: Optional remote filename. Defaults to the local filename.
             as_task: Process as async task for large files. Defaults to True.
 
-        Returns:
-            Success message or task ID for async uploads.
+            Success message with the uploaded remote path.
         """
         enforce_path_allowed(remote_dir)
         enforce_writable("upload_local_file")
@@ -166,12 +157,10 @@ def register_transfer_tools(mcp: FastMCP) -> None:
             return f"remote_name must be a filename only, not a path: {exc}"
 
         client = await get_client()
-        data = await client.upload(
+        await client.upload(
             path=remote_dir,
             file_content=_iter_file_chunks(file_path),
             file_name=final_name,
             as_task=as_task,
         )
-        if data is not None and data != {}:
-            return f"Upload task created: {json.dumps(data, ensure_ascii=False)}"
         return f"File uploaded successfully: {remote_dir}/{final_name}"

@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-import json
+from collections.abc import Mapping
+from typing import Any
 
 from mcp.server.mcpserver import MCPServer as FastMCP
 
 from ..client import OpenList2FAError, OpenListError, _generate_totp, get_client
 from ..config import get_config
-from . import enforce_writable
+from . import compact_json, enforce_writable, first_present, list_value
 
 
 def register_auth_tools(mcp: FastMCP) -> None:
@@ -66,11 +67,11 @@ def register_public_tools(mcp: FastMCP) -> None:
         share settings, and other public configuration.
 
         Returns:
-            JSON string of public settings.
+            Compact JSON containing the public settings.
         """
         client = await get_client()
         data = await client.request("GET", "public/settings", require_auth=False)
-        return json.dumps(data, indent=2, ensure_ascii=False)
+        return compact_json(data)
 
     @mcp.tool()
     async def list_my_ssh_keys() -> str:
@@ -79,11 +80,25 @@ def register_public_tools(mcp: FastMCP) -> None:
         Useful when the OpenList server uses SFTP/SSH storage backends.
 
         Returns:
-            JSON string with SSH key list.
+            JSON string with keys containing id, title, and fingerprint only.
         """
         client = await get_client()
         data = await client.request("GET", "me/sshkey/list")
-        return json.dumps(data, indent=2, ensure_ascii=False)
+        keys: list[dict[str, Any]] = []
+        for item in list_value(data, ("keys", "value", "content")):
+            if not isinstance(item, Mapping):
+                continue
+            key: dict[str, Any] = {}
+            for output, fields in (
+                ("id", ("id",)),
+                ("title", ("title", "name")),
+                ("fingerprint", ("fingerprint",)),
+            ):
+                value = first_present(item, fields)
+                if value is not None:
+                    key[output] = value
+            keys.append(key)
+        return compact_json({"keys": keys})
 
     @mcp.tool()
     async def add_ssh_key(title: str, public_key: str) -> str:

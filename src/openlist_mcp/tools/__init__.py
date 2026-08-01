@@ -1,6 +1,10 @@
 """OpenList MCP Tools package."""
 
 import posixpath
+from collections.abc import Mapping, Sequence
+from typing import Any
+
+import orjson
 
 from ..config import get_config
 
@@ -87,10 +91,12 @@ def validate_pagination(page: int, per_page: int, max_per_page: int = 200) -> No
         raise ValueError(f"per_page must be between 1 and {max_per_page}")
 
 
-async def _list_items(client, path: str, password: str = ""):
+async def _list_items(client: Any, path: str, password: str = "") -> list[Any]:
     """List items in a directory, returning parsed items or empty list on error."""
     try:
-        data = await client.request("POST", "fs/list", json={"path": path, "page": 1, "per_page": 200, "password": password})
+        data = await client.request(
+            "POST", "fs/list", json={"path": path, "page": 1, "per_page": 200, "password": password}
+        )
         items = data.get("content", data.get("value", []))
         if not isinstance(items, list):
             items = []
@@ -98,10 +104,11 @@ async def _list_items(client, path: str, password: str = ""):
     except Exception:
         return []
 
+
 def _human_size(size_bytes: int) -> str:
     """Format a byte count as a human-readable string."""
     if size_bytes == 0:
-        return '0 B'
+        return "0 B"
     units = ["B", "KB", "MB", "GB", "TB", "PB"]
     i = 0
     size = float(size_bytes)
@@ -109,3 +116,121 @@ def _human_size(size_bytes: int) -> str:
         size /= 1024
         i += 1
     return f"{size:.1f} {units[i]}"
+
+
+def compact_json(payload: object) -> str:
+    """Serialize a tool response without formatting whitespace."""
+    return orjson.dumps(payload).decode("utf-8")
+
+
+def _has_compact_value(value: Any) -> bool:
+    return value is not None and value != "" and value != {} and value != []
+
+
+def compact_fields(data: Mapping[str, Any], fields: Sequence[str]) -> dict[str, Any]:
+    """Keep explicitly requested fields that have meaningful values."""
+    return {
+        field: data[field] for field in fields if field in data and _has_compact_value(data[field])
+    }
+
+
+def first_present(data: Mapping[str, Any], fields: Sequence[str]) -> Any | None:
+    """Return the first requested field whose value is meaningful."""
+    for field in fields:
+        if field in data and _has_compact_value(data[field]):
+            return data[field]
+    return None
+
+
+def list_value(data: object, fields: Sequence[str]) -> list[Any]:
+    """Extract a list from a direct response or known mapping containers."""
+    if isinstance(data, list):
+        return data
+    if isinstance(data, Mapping):
+        for field in fields:
+            value = data.get(field)
+            if isinstance(value, list):
+                return value
+    return []
+
+
+def collect_task_ids(payload: object) -> list[str]:
+    """Collect stable task identifiers from an action response."""
+    task_ids: list[str] = []
+    seen: set[str] = set()
+
+    def visit(value: object) -> None:
+        if isinstance(value, Mapping):
+            for field in ("task_id", "tid", "id"):
+                candidate = value.get(field)
+                if candidate is None or candidate == "" or isinstance(candidate, (Mapping, list)):
+                    continue
+                task_id = str(candidate)
+                if task_id not in seen:
+                    seen.add(task_id)
+                    task_ids.append(task_id)
+            for field in ("task", "tasks", "value", "data"):
+                if field in value:
+                    visit(value[field])
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+
+    visit(payload)
+    return task_ids
+
+
+def compact_file_entry(item: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Project an OpenList file item to the stable browser entry shape."""
+    name = item.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return None
+    is_dir_value = item.get("is_dir")
+    is_dir = (
+        is_dir_value if isinstance(is_dir_value, bool) else item.get("type") in (1, "dir", "folder")
+    )
+    size = item.get("size", 0)
+    if not isinstance(size, int) or isinstance(size, bool):
+        size = 0
+    return {"name": name, "is_dir": is_dir, "size": size}
+
+
+def compact_user(data: Mapping[str, Any]) -> dict[str, Any]:
+    """Project a user object without credentials or permission internals."""
+    result: dict[str, Any] = {}
+    for output, aliases in (
+        ("id", ("id",)),
+        ("username", ("username", "name")),
+        ("role", ("role",)),
+        ("base_path", ("base_path",)),
+        ("disabled", ("disabled",)),
+        ("two_factor_enabled", ("two_factor_enabled", "two_factor")),
+    ):
+        value = first_present(data, aliases)
+        if value is not None:
+            result[output] = value
+    return result
+
+
+def action_result(
+    payload: object,
+    operation: str,
+    *,
+    task_type: str = "",
+    extras: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Project an action response to a small success DTO."""
+    result: dict[str, Any] = {"ok": True, "operation": operation}
+    if task_type:
+        result["task_type"] = task_type
+    task_ids = collect_task_ids(payload)
+    if task_ids:
+        result["task_ids"] = task_ids
+    message: Any = payload if isinstance(payload, str) else None
+    if (not isinstance(message, str) or not message) and isinstance(payload, Mapping):
+        message = first_present(payload, ("message", "msg"))
+    if isinstance(message, str) and message:
+        result["message"] = message
+    if extras:
+        result.update(compact_fields(extras, tuple(extras)))
+    return result

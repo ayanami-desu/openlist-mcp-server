@@ -1,7 +1,6 @@
 """Behavior tests for admin MCP tools (read-only and write operations)."""
 
-from __future__ import annotations
-
+import orjson
 import pytest
 
 # ─────────────────────────── Storage ────────────────────────────
@@ -351,5 +350,142 @@ async def test_reset_api_token_sends_post_request(admin_tools) -> None:
 
     result = await tools["reset_api_token"](confirm=True)
 
-    assert "reset successfully" in result
+    assert result == "API token reset successfully."
     assert client.requests == [("POST", "admin/setting/reset_token", {})]
+
+
+@pytest.mark.asyncio
+async def test_storage_and_driver_outputs_are_compact(admin_tools) -> None:
+    tools, client = admin_tools
+    client.responses["GET", "admin/storage/list"] = {
+        "value": [
+            {
+                "id": 1,
+                "mount_path": "/drive",
+                "driver": "OneDrive",
+                "status": "work",
+                "enable": False,
+                "total": 100,
+                "free": 40,
+                "config": {"client_secret": "secret"},
+            }
+        ],
+        "token": "secret",
+    }
+    client.responses["GET", "admin/driver/names"] = {
+        "value": ["Local", {"name": "S3"}, "Local", {"password": "drop"}]
+    }
+
+    storage = await tools["list_storages"]()
+    drivers = await tools["list_drivers"]()
+
+    assert orjson.loads(storage) == {
+        "storages": [
+            {
+                "id": 1,
+                "mount_path": "/drive",
+                "driver": "OneDrive",
+                "status": "work",
+                "enabled": False,
+                "total": 100,
+                "free": 40,
+            }
+        ]
+    }
+    assert orjson.loads(drivers) == {"drivers": ["Local", "S3"]}
+
+
+@pytest.mark.asyncio
+async def test_users_metas_and_index_drop_sensitive_fields(admin_tools) -> None:
+    tools, client = admin_tools
+    client.responses["GET", "admin/user/list"] = {
+        "value": [
+            {
+                "id": 7,
+                "username": "alice",
+                "role": 2,
+                "base_path": "/home",
+                "disabled": False,
+                "two_factor": True,
+                "password": "secret",
+                "permissions": 65535,
+            }
+        ],
+        "total": 4,
+    }
+    client.responses["GET", "admin/meta/list"] = {
+        "value": [
+            {
+                "id": 3,
+                "path": "/docs",
+                "enabled": True,
+                "write": False,
+                "hide": False,
+                "pwd": "secret",
+                "readme": "private readme",
+                "header": "private header",
+                "password": "secret",
+            }
+        ]
+    }
+    client.responses["GET", "admin/index/progress"] = {
+        "status": "running",
+        "progress": 0,
+        "total": 10,
+        "completed": 0,
+        "error": "",
+        "secret": "drop",
+    }
+
+    users = await tools["list_users"]()
+    metas = await tools["list_metas"]()
+    progress = await tools["get_index_progress"]()
+
+    assert orjson.loads(users) == {
+        "page": 1,
+        "per_page": 30,
+        "total": 4,
+        "users": [
+            {
+                "id": 7,
+                "username": "alice",
+                "role": 2,
+                "base_path": "/home",
+                "disabled": False,
+                "two_factor_enabled": True,
+            }
+        ],
+    }
+    assert orjson.loads(metas) == {
+        "metas": [
+            {
+                "id": 3,
+                "path": "/docs",
+                "enabled": True,
+                "write": False,
+                "hide": False,
+                "password_protected": True,
+                "readme_present": True,
+                "header_present": True,
+            }
+        ]
+    }
+    assert orjson.loads(progress) == {
+        "status": "running",
+        "progress": 0,
+        "total": 10,
+        "completed": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_get_settings_returns_sorted_keys_only(admin_tools) -> None:
+    tools, client = admin_tools
+    client.responses["GET", "admin/setting/list"] = {
+        "value": {"zeta": "1", "alpha": "2"},
+        "password": "secret",
+    }
+
+    result = await tools["get_settings"]()
+
+    assert orjson.loads(result) == {"keys": ["alpha", "zeta"], "total": 2}

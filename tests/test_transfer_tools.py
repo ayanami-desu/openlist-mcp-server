@@ -1,5 +1,6 @@
 """Behavior tests for transfer MCP tools."""
 
+import orjson
 import pytest
 
 
@@ -28,3 +29,41 @@ async def test_upload_file_sends_decoded_content(transfer_tools) -> None:
             "as_task": False,
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_get_download_url_hides_missing_raw_response(transfer_tools) -> None:
+    tools, client = transfer_tools
+    client.responses["POST", "fs/get"] = {
+        "name": "report.txt",
+        "type": 0,
+        "size": 12,
+        "raw_url": "",
+        "sign": "secret",
+        "hashinfo": "secret",
+    }
+
+    result = await tools["get_download_url"]("/docs/report.txt")
+
+    assert orjson.loads(result) == {
+        "ok": False,
+        "path": "/docs/report.txt",
+        "error": "No download URL available.",
+    }
+
+
+@pytest.mark.asyncio
+async def test_get_download_url_returns_only_direct_link(transfer_tools) -> None:
+    tools, client = transfer_tools
+    client.responses["POST", "fs/get"] = {
+        "raw_url": "https://download.invalid/signed",
+        "thumb": "secret",
+        "hash_info": "secret",
+    }
+
+    result = await tools["get_download_url"]("/docs/report.txt")
+
+    assert orjson.loads(result) == {
+        "download_url": "https://download.invalid/signed",
+        "path": "/docs/report.txt",
+    }

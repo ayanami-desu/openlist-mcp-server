@@ -2,12 +2,66 @@
 
 from __future__ import annotations
 
-import json
+from collections.abc import Mapping
+from typing import Any
 
 from mcp.server.mcpserver import MCPServer as FastMCP
 
 from ..client import get_client
-from . import enforce_path_allowed, enforce_writable, validate_pagination
+from . import (
+    compact_json,
+    enforce_path_allowed,
+    enforce_writable,
+    first_present,
+    list_value,
+    validate_pagination,
+)
+
+
+def _compact_share(
+    data: Mapping[str, Any],
+    *,
+    include_files: bool = False,
+    include_url: bool = False,
+    include_summary: bool = False,
+) -> dict[str, Any]:
+    """Project a share record without passwords or raw configuration."""
+    result: dict[str, Any] = {}
+    share_id = first_present(data, ("share_id", "id"))
+    if share_id is not None:
+        result["share_id"] = share_id
+    if include_url:
+        share_url = first_present(data, ("share_url", "url", "link"))
+        if share_url is not None:
+            result["share_url"] = share_url
+    expires = first_present(data, ("expires",))
+    if expires is not None:
+        result["expires"] = expires
+    if include_summary or include_files:
+        for output, fields in (
+            ("enabled", ("enabled",)),
+            ("max_accessed", ("max_accessed", "max_access")),
+            ("accessed", ("accessed", "access_count")),
+            ("remark", ("remark",)),
+        ):
+            value = first_present(data, fields)
+            if value is not None:
+                result[output] = value
+    for field in ("password_protected", "has_password", "pwd"):
+        if field in data:
+            result["password_protected"] = bool(data[field])
+            break
+    if include_files:
+        files: list[Any] = []
+        for item in list_value(data, ("files",)):
+            if isinstance(item, str) and item.strip():
+                files.append(item)
+            elif isinstance(item, Mapping):
+                path = first_present(item, ("path", "name"))
+                if isinstance(path, str) and path.strip():
+                    files.append(path)
+        result["files"] = files
+    return result
 
 
 def register_share_tools(mcp: FastMCP) -> None:
@@ -35,12 +89,11 @@ def register_share_tools(mcp: FastMCP) -> None:
             remark: Optional remark or note for the share link.
 
         Returns:
-            JSON string with share details including the share URL/id.
+            JSON string with share_id, share_url, expires, and password_protected.
         """
         if not files:
-            return json.dumps(
-                {"ok": False, "error": "At least one file must be specified to create a share."},
-                ensure_ascii=False,
+            return compact_json(
+                {"ok": False, "error": "At least one file must be specified to create a share."}
             )
         for f in files:
             enforce_path_allowed(f)
@@ -58,7 +111,7 @@ def register_share_tools(mcp: FastMCP) -> None:
 
         client = await get_client()
         data = await client.request("POST", "share/create", json=body)
-        return json.dumps(data, indent=2, ensure_ascii=False)
+        return compact_json(_compact_share(data, include_url=True))
 
     @mcp.tool()
     async def get_share_info(share_id: str) -> str:
@@ -68,11 +121,11 @@ def register_share_tools(mcp: FastMCP) -> None:
             share_id: The unique ID of the share to query.
 
         Returns:
-            JSON string with share details.
+            JSON string with compact share details and a files array.
         """
         client = await get_client()
         data = await client.request("GET", "share/get", params={"id": share_id})
-        return json.dumps(data, indent=2, ensure_ascii=False)
+        return compact_json(_compact_share(data, include_files=True, include_url=True))
 
     @mcp.tool()
     async def list_shares(page: int = 1, per_page: int = 50) -> str:
@@ -83,7 +136,7 @@ def register_share_tools(mcp: FastMCP) -> None:
             per_page: Number of items per page (max 200). Defaults to 50.
 
         Returns:
-            JSON string containing share list with id, path, password status, expiration, etc.
+            JSON string containing page, per_page, total, and compact shares.
         """
         validate_pagination(page, per_page)
         client = await get_client()
@@ -92,7 +145,23 @@ def register_share_tools(mcp: FastMCP) -> None:
             "share/list",
             params={"page": page, "per_page": per_page},
         )
-        return json.dumps(data, indent=2, ensure_ascii=False)
+        items = list_value(data, ("value", "shares", "content"))
+        shares = [
+            _compact_share(item, include_summary=True)
+            for item in items
+            if isinstance(item, Mapping)
+        ]
+        total = data.get("total") if isinstance(data, Mapping) else None
+        if not isinstance(total, int) or isinstance(total, bool):
+            total = len(shares)
+        return compact_json(
+            {
+                "page": page,
+                "per_page": per_page,
+                "total": total,
+                "shares": shares,
+            }
+        )
 
     @mcp.tool()
     async def update_share(
@@ -136,15 +205,14 @@ def register_share_tools(mcp: FastMCP) -> None:
             if current_files:
                 body["files"] = current_files
             else:
-                return json.dumps(
+                return compact_json(
                     {
                         "ok": False,
                         "error": (
                             f"Share '{share_id}' not found or has no files. "
                             "Please provide the files parameter explicitly."
                         ),
-                    },
-                    ensure_ascii=False,
+                    }
                 )
 
         if pwd:

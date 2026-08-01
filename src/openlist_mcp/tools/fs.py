@@ -2,23 +2,26 @@
 
 from __future__ import annotations
 
-import json
 import posixpath
+from collections.abc import Mapping
+from typing import Any
 
 from mcp.server.mcpserver import MCPServer as FastMCP
 
 from ..client import OpenListError, get_client
 from . import (
-    _human_size,
     _list_items,
+    action_result,
+    compact_fields,
+    compact_file_entry,
+    compact_json,
     enforce_path_allowed,
     enforce_writable,
+    list_value,
     normalize_names,
     validate_name,
     validate_pagination,
 )
-
-
 
 
 def register_fs_tools(mcp: FastMCP) -> None:
@@ -40,7 +43,7 @@ def register_fs_tools(mcp: FastMCP) -> None:
             password: Password if the directory is password-protected. Defaults to "".
 
         Returns:
-            JSON string containing file list with name, size, type, modified time, etc.
+            JSON string with path, page, per_page, total, and compact entries.
         """
         enforce_path_allowed(path)
         validate_pagination(page, per_page)
@@ -55,7 +58,25 @@ def register_fs_tools(mcp: FastMCP) -> None:
                 "password": password,
             },
         )
-        return json.dumps(data, indent=2, ensure_ascii=False)
+        items = list_value(data, ("content", "value"))
+        entries = []
+        for item in items:
+            if isinstance(item, Mapping):
+                entry = compact_file_entry(item)
+                if entry is not None:
+                    entries.append(entry)
+        total = data.get("total") if isinstance(data, Mapping) else None
+        if not isinstance(total, int) or isinstance(total, bool):
+            total = len(entries)
+        return compact_json(
+            {
+                "path": path,
+                "page": page,
+                "per_page": per_page,
+                "total": total,
+                "entries": entries,
+            }
+        )
 
     @mcp.tool()
     async def list_dirs(
@@ -74,7 +95,7 @@ def register_fs_tools(mcp: FastMCP) -> None:
             force_root: Ask OpenList to force listing from root when supported.
 
         Returns:
-            JSON string containing child directory entries.
+            JSON string containing child directory names.
         """
         enforce_path_allowed(path)
         client = await get_client()
@@ -87,7 +108,15 @@ def register_fs_tools(mcp: FastMCP) -> None:
                 "force_root": force_root,
             },
         )
-        return json.dumps(data, indent=2, ensure_ascii=False)
+        items = list_value(data, ("value", "content"))
+        directories = [
+            item["name"]
+            for item in items
+            if isinstance(item, Mapping)
+            and isinstance(item.get("name"), str)
+            and item["name"].strip()
+        ]
+        return compact_json({"path": path, "directories": directories})
 
     @mcp.tool()
     async def get_file_info(
@@ -101,7 +130,7 @@ def register_fs_tools(mcp: FastMCP) -> None:
             password: Password if the path is password-protected. Defaults to "".
 
         Returns:
-            JSON string with file details including size, type, provider, raw_url, etc.
+            JSON string with path, name, is_dir, size, and optional timestamps/provider.
         """
         enforce_path_allowed(path)
         client = await get_client()
@@ -113,7 +142,17 @@ def register_fs_tools(mcp: FastMCP) -> None:
                 "password": password,
             },
         )
-        return json.dumps(data, indent=2, ensure_ascii=False)
+        source = dict(data) if isinstance(data, Mapping) else {}
+        name = source.get("name")
+        if not isinstance(name, str) or not name.strip():
+            source["name"] = posixpath.basename(path.rstrip("/")) or "/"
+        entry = compact_file_entry(source)
+        if entry is None:
+            entry = {"name": "/", "is_dir": False, "size": 0}
+        result: dict[str, Any] = {"path": path, **entry}
+        if isinstance(data, Mapping):
+            result.update(compact_fields(data, ("modified", "created", "provider")))
+        return compact_json(result)
 
     @mcp.tool()
     async def search_files(
@@ -135,7 +174,7 @@ def register_fs_tools(mcp: FastMCP) -> None:
             password: Password if the directory is password-protected. Defaults to "".
 
         Returns:
-            JSON string containing matching files and folders.
+            JSON string with parent, page, per_page, total, and compact entries.
         """
         enforce_path_allowed(parent)
         validate_pagination(page, per_page)
@@ -152,7 +191,32 @@ def register_fs_tools(mcp: FastMCP) -> None:
                 "password": password,
             },
         )
-        return json.dumps(data, indent=2, ensure_ascii=False)
+        items = list_value(data, ("content", "value"))
+        entries = []
+        for item in items:
+            if not isinstance(item, Mapping):
+                continue
+            entry = compact_file_entry(item)
+            if entry is None:
+                continue
+            item_parent = item.get("parent")
+            base = item_parent if isinstance(item_parent, str) and item_parent.strip() else parent
+            if base.startswith("/"):
+                base = "/" + base.lstrip("/")
+            base = base.rstrip("/") or "/"
+            entries.append({"path": posixpath.join(base, entry["name"]), **entry})
+        total = data.get("total") if isinstance(data, Mapping) else None
+        if not isinstance(total, int) or isinstance(total, bool):
+            total = len(entries)
+        return compact_json(
+            {
+                "parent": parent,
+                "page": page,
+                "per_page": per_page,
+                "total": total,
+                "entries": entries,
+            }
+        )
 
     @mcp.tool()
     async def create_folder(
@@ -213,7 +277,7 @@ def register_fs_tools(mcp: FastMCP) -> None:
             rename_objects: List of objects with src_name and new_name fields.
 
         Returns:
-            Success message or OpenList task/result info.
+            Success message or compact action result.
         """
         enforce_path_allowed(src_dir)
         enforce_writable("batch_rename")
@@ -237,9 +301,13 @@ def register_fs_tools(mcp: FastMCP) -> None:
                 "rename_objects": normalized_objects,
             },
         )
-        if data is not None and data != {}:
-            return f"Batch rename result: {json.dumps(data, ensure_ascii=False)}"
-        return f"Batch renamed successfully in {src_dir}: {normalized_objects}"
+        return compact_json(
+            action_result(
+                data,
+                "batch_rename",
+                extras={"affected": len(normalized_objects)},
+            )
+        )
 
     @mcp.tool()
     async def regex_rename(
@@ -271,7 +339,7 @@ def register_fs_tools(mcp: FastMCP) -> None:
                            capture groups (Go regex syntax).
 
         Returns:
-            Success or error message with operation result.
+            Success message or compact action result.
         """
         enforce_writable("regex_rename")
         enforce_path_allowed(src_dir)
@@ -285,9 +353,7 @@ def register_fs_tools(mcp: FastMCP) -> None:
                 "new_name_regex": new_name_regex,
             },
         )
-        if data is not None and data != {}:
-            return f"Regex rename result: {json.dumps(data, ensure_ascii=False)}"
-        return f"Regex rename completed in {src_dir}: {src_name_regex} -> {new_name_regex}"
+        return compact_json(action_result(data, "regex_rename"))
 
     @mcp.tool()
     async def copy(
@@ -303,7 +369,7 @@ def register_fs_tools(mcp: FastMCP) -> None:
             names: List of file/folder names or comma-separated string to copy (e.g. ["file1.txt", "file2.pdf"] or "file1.txt,file2.pdf").
 
         Returns:
-            Success or error message with task info if processed asynchronously.
+            Success message or compact action result.
         """
         enforce_writable("copy")
         enforce_path_allowed(src_dir)
@@ -322,9 +388,7 @@ def register_fs_tools(mcp: FastMCP) -> None:
                 "names": name_list,
             },
         )
-        if data is not None and data != {}:
-            return f"Copy task created: {json.dumps(data, ensure_ascii=False)}"
-        return f"Copied successfully: {name_list} -> {dst_dir}"
+        return compact_json(action_result(data, "copy", extras={"affected": len(name_list)}))
 
     @mcp.tool()
     async def move(
@@ -340,7 +404,7 @@ def register_fs_tools(mcp: FastMCP) -> None:
             names: List of file/folder names or comma-separated string to move (e.g. ["file1.txt", "file2.pdf"] or "file1.txt,file2.pdf").
 
         Returns:
-            Success or error message with task info if processed asynchronously.
+            Success message or compact action result.
         """
         enforce_writable("move")
         enforce_path_allowed(src_dir)
@@ -359,9 +423,7 @@ def register_fs_tools(mcp: FastMCP) -> None:
                 "names": name_list,
             },
         )
-        if data is not None and data != {}:
-            return f"Move task created: {json.dumps(data, ensure_ascii=False)}"
-        return f"Moved successfully: {name_list} -> {dst_dir}"
+        return compact_json(action_result(data, "move", extras={"affected": len(name_list)}))
 
     @mcp.tool()
     async def remove(
@@ -425,9 +487,7 @@ def register_fs_tools(mcp: FastMCP) -> None:
             "fs/remove_empty_directory",
             json={"src_dir": src_dir},
         )
-        if data is not None and data != {}:
-            return f"Empty directory removal result: {json.dumps(data, ensure_ascii=False)}"
-        return f"Empty directories removed successfully under: {src_dir}"
+        return compact_json(action_result(data, "remove_empty_dirs"))
 
     @mcp.tool()
     async def recursive_move(
@@ -444,7 +504,7 @@ def register_fs_tools(mcp: FastMCP) -> None:
             dst_dir: Destination directory path.
 
         Returns:
-            Success message or task info.
+            Success message or compact action result.
         """
         enforce_path_allowed(src_dir)
         enforce_path_allowed(dst_dir)
@@ -459,7 +519,7 @@ def register_fs_tools(mcp: FastMCP) -> None:
                 json={"src_dir": src_dir, "dst_dir": dst_dir},
             )
             if data is not None and data != {}:
-                return f"Recursive move task created: {json.dumps(data, ensure_ascii=False)}"
+                return compact_json(action_result(data, "recursive_move"))
             return f"Recursive move completed: {src_dir} -> {dst_dir}"
         except OpenListError as exc:
             message = exc.message.lower()
@@ -555,7 +615,10 @@ def register_fs_tools(mcp: FastMCP) -> None:
             dirs = sorted(
                 [i for i in items if i.get("type") in (1, "dir", "folder")], key=lambda x: x["name"]
             )
-            files = sorted([i for i in items if i.get("type") not in (1, "dir", "folder")], key=lambda x: x["name"])
+            files = sorted(
+                [i for i in items if i.get("type") not in (1, "dir", "folder")],
+                key=lambda x: x["name"],
+            )
             entries = dirs + files
 
             for idx, entry in enumerate(entries):
@@ -597,7 +660,7 @@ def register_fs_tools(mcp: FastMCP) -> None:
             password: Password if the path is password-protected.
 
         Returns:
-            JSON string with size breakdown by directory and file type.
+            JSON string with path, total_size, total_files, top_directories, and by_file_type.
         """
         client = await get_client()
 
@@ -652,22 +715,18 @@ def register_fs_tools(mcp: FastMCP) -> None:
         result = {
             "path": path,
             "total_size": total_size,
-            "total_size_human": _human_size(total_size),
             "total_files": total_files,
-            "top_directories": [
-                {"path": p, "size": s, "size_human": _human_size(s)} for p, s in top_dirs
-            ],
+            "top_directories": [{"path": p, "size": s} for p, s in top_dirs],
             "by_file_type": [
                 {
                     "extension": ext,
                     "count": type_counts.get(ext, 0),
                     "size": s,
-                    "size_human": _human_size(s),
                 }
                 for ext, s in top_types
             ],
         }
-        return json.dumps(result, indent=2, ensure_ascii=False)
+        return compact_json(result)
 
     @mcp.tool()
     async def mirror(
@@ -695,7 +754,7 @@ def register_fs_tools(mcp: FastMCP) -> None:
             password: Password if the path is password-protected.
 
         Returns:
-            Report of files copied, skipped, and deleted.
+            JSON report with bounded copy/delete previews and a truncated flag.
         """
         enforce_path_allowed(src_dir)
         enforce_path_allowed(dst_dir)
@@ -771,6 +830,7 @@ def register_fs_tools(mcp: FastMCP) -> None:
                     to_delete.append(rel)
         to_copy.sort(key=lambda x: (0, x) if x.endswith("/") else (1, x))
 
+        truncated = len(to_copy) > 20 or len(to_delete) > 20
         report = {
             "src_dir": src_dir,
             "dst_dir": dst_dir,
@@ -782,11 +842,11 @@ def register_fs_tools(mcp: FastMCP) -> None:
             "files_to_delete": len(to_delete),
             "copy_list": to_copy[:20],
             "delete_list": to_delete[:20],
-            "note": "truncated at 20 items" if len(to_copy) > 20 or len(to_delete) > 20 else "",
+            "truncated": truncated,
         }
 
         if dry_run:
-            return json.dumps(report, indent=2, ensure_ascii=False)
+            return compact_json(report)
 
         # Execute
         copied = 0
@@ -833,5 +893,8 @@ def register_fs_tools(mcp: FastMCP) -> None:
 
         report["copied"] = copied
         report["deleted"] = deleted
-        report["errors"] = errors
-        return json.dumps(report, indent=2, ensure_ascii=False)
+        if errors:
+            report["errors_total"] = len(errors)
+            report["errors"] = errors[:20]
+            report["truncated"] = report["truncated"] or len(errors) > 20
+        return compact_json(report)

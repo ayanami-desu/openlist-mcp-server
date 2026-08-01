@@ -1,11 +1,28 @@
 """Behavior tests for task MCP tools."""
 
+import orjson
 import pytest
 
 
 @pytest.mark.asyncio
 async def test_list_tasks_uses_typed_task_endpoint(task_tools) -> None:
     tools, client = task_tools
+    client.responses["GET", "task/offline_download/done"] = {
+        "value": [
+            {
+                "id": "task-1",
+                "title": "download",
+                "state": "done",
+                "percent": 0,
+                "dst_path": "/downloads/file.iso",
+                "error_message": "",
+                "created": "today",
+                "updated": "now",
+                "token": "secret",
+            }
+        ],
+        "total": 9,
+    }
 
     result = await tools["list_tasks"](
         task_type="offline_download",
@@ -14,7 +31,24 @@ async def test_list_tasks_uses_typed_task_endpoint(task_tools) -> None:
         per_page=25,
     )
 
-    assert result == "{}"
+    assert orjson.loads(result) == {
+        "task_type": "offline_download",
+        "status": "done",
+        "page": 2,
+        "per_page": 25,
+        "total": 9,
+        "tasks": [
+            {
+                "task_id": "task-1",
+                "name": "download",
+                "status": "done",
+                "progress": 0,
+                "path": "/downloads/file.iso",
+                "created_at": "today",
+                "updated_at": "now",
+            }
+        ],
+    }
     assert client.requests == [
         (
             "GET",
@@ -27,6 +61,10 @@ async def test_list_tasks_uses_typed_task_endpoint(task_tools) -> None:
 @pytest.mark.asyncio
 async def test_list_tasks_all_queries_all_categories(task_tools) -> None:
     tools, client = task_tools
+    client.responses["GET", "task/copy/undone"] = {
+        "value": [{"id": "copy-1", "name": "copy", "status": "running", "secret": "drop"}],
+        "total": 99,
+    }
 
     result = await tools["list_tasks"](task_type="all", status="undone")
 
@@ -38,9 +76,22 @@ async def test_list_tasks_all_queries_all_categories(task_tools) -> None:
         ("GET", "task/offline_download_transfer/undone", {"params": {"page": 1, "per_page": 50}}),
         ("GET", "task/upload/undone", {"params": {"page": 1, "per_page": 50}}),
     ]
-    assert '"task_type": "all"' in result
-    assert '"results"' in result
-    assert '"total"' in result
+    data = orjson.loads(result)
+    assert data == {
+        "task_type": "all",
+        "status": "undone",
+        "page": 1,
+        "per_page": 50,
+        "total": 1,
+        "tasks": [
+            {
+                "task_id": "copy-1",
+                "name": "copy",
+                "status": "running",
+                "task_type": "copy",
+            }
+        ],
+    }
 
 
 @pytest.mark.asyncio
@@ -49,7 +100,10 @@ async def test_get_task_info_uses_tid_query_param(task_tools) -> None:
 
     result = await tools["get_task_info"]("task-123", task_type="offline_download")
 
-    assert result == "{}"
+    assert orjson.loads(result) == {
+        "task_id": "task-123",
+        "task_type": "offline_download",
+    }
     assert client.requests == [
         (
             "POST",
@@ -200,3 +254,16 @@ async def test_batch_tasks_require_nonempty_ids(task_tools) -> None:
 
     result = await tools["batch_retry_tasks"](task_ids=[], task_type="offline_download")
     assert "no task" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_list_tasks_all_reports_failed_categories(task_tools) -> None:
+    tools, client = task_tools
+    client.responses["GET", "task/copy/undone"] = RuntimeError("copy unavailable")
+
+    result = await tools["list_tasks"](task_type="all")
+
+    data = orjson.loads(result)
+    assert data["total"] == 0
+    assert data["tasks"] == []
+    assert data["errors"] == [{"task_type": "copy", "error": "copy unavailable"}]

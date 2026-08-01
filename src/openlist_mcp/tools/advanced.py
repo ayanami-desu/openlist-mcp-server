@@ -6,32 +6,33 @@ Includes offline download, archive decompression, and related utilities.
 from __future__ import annotations
 
 import base64
-import contextlib
 import ipaddress
-import json
 import os
 import posixpath
 import socket
+from collections.abc import Mapping
 from typing import Any
 from urllib.parse import urlparse
 
+import httpx
 from mcp.server.mcpserver import MCPServer as FastMCP
 
-from ..client import OpenListError, get_client
+from ..client import get_client
 from ..config import get_config
-import httpx
 from . import (
+    _list_items,
+    action_result,
+    compact_file_entry,
+    compact_json,
+    compact_user,
     enforce_path_allowed,
     enforce_writable,
+    first_present,
+    list_value,
     normalize_names,
     validate_name,
     validate_path,
-    _human_size,
-    _list_items,
 )
-
-
-
 
 # Internal IP ranges that should be blocked for SSRF prevention.
 _PRIVATE_NETWORKS = [
@@ -101,6 +102,81 @@ def _reject_internal_url(url: str) -> None:
             )
 
 
+def _stable_strings(data: object, fields: tuple[str, ...]) -> list[str]:
+    values = list_value(data, fields)
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        if isinstance(item, str) and item.strip() and item not in seen:
+            seen.add(item)
+            result.append(item)
+    return result
+
+
+def _download_tool_names(data: object) -> list[str]:
+    """Extract stable download-tool names from known response containers."""
+    result: list[str] = []
+    seen: set[str] = set()
+    values = list_value(data, ("value", "data"))
+    if (
+        not values
+        and isinstance(data, Mapping)
+        and any(field in data for field in ("name", "tool", "id"))
+    ):
+        values = [data]
+    for item in values:
+        name = item if isinstance(item, str) else None
+        if isinstance(item, Mapping):
+            name = first_present(item, ("name", "tool", "id"))
+        if isinstance(name, str) and name.strip() and name not in seen:
+            seen.add(name)
+            result.append(name)
+    return result
+
+
+def _compact_torrent(
+    data: Mapping[str, Any],
+    include_torrent_data: bool = False,
+) -> dict[str, Any]:
+    """Project torrent metadata and file paths without raw response fields."""
+    info_value = data.get("info")
+    info: Mapping[str, Any] = info_value if isinstance(info_value, Mapping) else {}
+
+    def value(fields: tuple[str, ...]) -> Any:
+        item = first_present(data, fields)
+        return first_present(info, fields) if item is None else item
+
+    result: dict[str, Any] = {}
+    for output, fields in (
+        ("name", ("name", "torrent_name")),
+        ("info_hash", ("info_hash", "infohash")),
+        ("total_size", ("total_size", "size")),
+    ):
+        item = value(fields)
+        if item is not None:
+            result[output] = item
+
+    files = list_value(data, ("files", "content", "value"))
+    if not files and isinstance(info, Mapping):
+        files = list_value(info, ("files", "content", "value"))
+    compact_files: list[dict[str, Any]] = []
+    for item in files:
+        if not isinstance(item, Mapping):
+            continue
+        path = first_present(item, ("path", "name"))
+        if not isinstance(path, str) or not path.strip():
+            continue
+        size = item.get("size", 0)
+        if not isinstance(size, int) or isinstance(size, bool):
+            size = 0
+        compact_files.append({"path": path, "size": size})
+    result["files"] = compact_files
+    torrent_data = data.get("torrent_data")
+    if include_torrent_data and isinstance(torrent_data, str) and torrent_data:
+        result["torrent_data"] = torrent_data
+    return result
+
+
 def register_advanced_tools(mcp: FastMCP) -> None:
     """Register advanced file operation MCP tools."""
 
@@ -108,52 +184,26 @@ def register_advanced_tools(mcp: FastMCP) -> None:
     async def get_capabilities() -> str:
         """Summarize this MCP server's OpenList capabilities and safety settings.
 
-        Returns public server settings, the authenticated user profile when available,
-        configured offline download tools, and local MCP safety configuration.
-        Use this before high-impact operations to understand what the server supports.
+        Returns:
+            JSON string with authentication, features, and MCP safety summaries.
         """
         config = get_config()
         client = await get_client()
-
-        # Best-effort: each endpoint can fail independently
-        public_settings = {}
-        with contextlib.suppress(Exception):
-            public_settings = await client.request(
-                "GET",
-                "public/settings",
-                require_auth=False,
-            )
-
-        user = None
-        with contextlib.suppress(Exception):
-            user = await client.request("GET", "me")
-
-        download_tools = []
-        with contextlib.suppress(Exception):
+        download_tools: list[str] = []
+        try:
             download_tools_data = await client.request(
                 "GET",
                 "public/offline_download_tools",
                 require_auth=False,
             )
-            download_tools = (
-                download_tools_data
-                if isinstance(download_tools_data, list)
-                else download_tools_data.get(
-                    "value",
-                    download_tools_data.get("data", []),
-                )
-            )
+            download_tools = _download_tool_names(download_tools_data)
+        except Exception:
+            pass
 
         capabilities = {
-            "server": {
-                "base_url": config.base_url,
-                "uses_https": config.base_url.startswith("https://"),
-                "public_settings": public_settings,
-            },
             "authentication": {
                 "credentials_configured": config.is_authenticated,
                 "totp_secret_configured": config.has_totp_secret,
-                "user": user,
             },
             "features": {
                 "file_browse": True,
@@ -173,7 +223,7 @@ def register_advanced_tools(mcp: FastMCP) -> None:
                 ),
             },
         }
-        return json.dumps(capabilities, indent=2, ensure_ascii=False)
+        return compact_json(capabilities)
 
     @mcp.tool()
     async def offline_download(
@@ -199,7 +249,7 @@ def register_advanced_tools(mcp: FastMCP) -> None:
             delete_policy: Optional delete policy for completed tasks.
 
         Returns:
-            JSON string with created task info.
+            Compact action JSON with operation, task_type, task_ids, and message.
         """
         enforce_path_allowed(path)
         enforce_writable("offline_download")
@@ -223,9 +273,8 @@ def register_advanced_tools(mcp: FastMCP) -> None:
             body["tool"] = tool
         if delete_policy:
             body["delete_policy"] = delete_policy
-
         data = await client.request("POST", "fs/add_offline_download", json=body)
-        return json.dumps(data, indent=2, ensure_ascii=False)
+        return compact_json(action_result(data, "offline_download", task_type="offline_download"))
 
     @mcp.tool()
     async def batch_download(
@@ -246,13 +295,13 @@ def register_advanced_tools(mcp: FastMCP) -> None:
             delete_policy: Optional delete policy for completed tasks.
 
         Returns:
-            JSON string with results for each URL.
+            JSON array with one compact result per URL.
         """
         enforce_path_allowed(path)
         enforce_writable("batch_download")
 
         if not urls:
-            return json.dumps({"ok": False, "error": "No URLs provided."}, ensure_ascii=False)
+            return compact_json([])
 
         # SSRF check for each URL
         for url in urls:
@@ -266,7 +315,7 @@ def register_advanced_tools(mcp: FastMCP) -> None:
                 _reject_internal_url(url)
 
         client = await get_client()
-        results = []
+        results: list[dict[str, Any]] = []
         for url in urls:
             try:
                 body: dict[str, Any] = {"urls": [url], "path": path}
@@ -275,11 +324,16 @@ def register_advanced_tools(mcp: FastMCP) -> None:
                 if delete_policy:
                     body["delete_policy"] = delete_policy
                 data = await client.request("POST", "fs/add_offline_download", json=body)
-                results.append({"url": url, "status": "created", "result": data})
-            except Exception as e:
-                results.append({"url": url, "status": "failed", "error": str(e)})
+                summary = action_result(data, "offline_download", task_type="offline_download")
+                entry: dict[str, Any] = {"url": url, "ok": True}
+                for field in ("task_ids", "message"):
+                    if field in summary:
+                        entry[field] = summary[field]
+                results.append(entry)
+            except Exception as exc:
+                results.append({"url": url, "ok": False, "error": str(exc)})
 
-        return json.dumps(results, indent=2, ensure_ascii=False)
+        return compact_json(results)
 
     @mcp.tool()
     async def find_duplicates(
@@ -316,10 +370,14 @@ def register_advanced_tools(mcp: FastMCP) -> None:
                 return
 
             for item in items:
-                name = item["name"]
-                size = item.get("size", 0) or 0
-                typ = item.get("type", "")
-                is_dir = typ in (1, "dir", "folder")
+                if not isinstance(item, Mapping):
+                    continue
+                compact = compact_file_entry(item)
+                if compact is None:
+                    continue
+                name = compact["name"]
+                size = compact["size"]
+                is_dir = compact["is_dir"]
 
                 if is_dir:
                     sub_path = f"{dir_path.rstrip('/')}/{name}"
@@ -345,16 +403,13 @@ def register_advanced_tools(mcp: FastMCP) -> None:
             "total_duplicate_files": sum(len(v) for v in duplicates.values()),
             "duplicates": [
                 {
-                    "key": k,
-                    "files": v,
-                    "count": len(v),
                     "size": v[0]["size"],
-                    "size_human": _human_size(v[0]["size"]),
+                    "files": [entry["path"] for entry in v],
                 }
-                for k, v in sorted(duplicates.items(), key=lambda x: -len(x[1]))
+                for v in sorted(duplicates.values(), key=lambda entries: -len(entries))
             ],
         }
-        return json.dumps(result, indent=2, ensure_ascii=False)
+        return compact_json(result)
 
     @mcp.tool()
     async def content_preview(
@@ -376,7 +431,7 @@ def register_advanced_tools(mcp: FastMCP) -> None:
             password: Password if the path is password-protected.
 
         Returns:
-            The file content preview as plain text, or an error message.
+            JSON object with path, content, truncated, and optional language.
         """
         enforce_path_allowed(path)
         client = await get_client()
@@ -390,10 +445,7 @@ def register_advanced_tools(mcp: FastMCP) -> None:
         raw_url = data.get("raw_url", "") if isinstance(data, dict) else ""
 
         if not raw_url:
-            return json.dumps(
-                {"ok": False, "error": "No download URL available for this file."},
-                ensure_ascii=False,
-            )
+            return compact_json({"ok": False, "error": "No download URL available for this file."})
 
         # Fetch with range to limit bytes
 
@@ -402,10 +454,7 @@ def register_advanced_tools(mcp: FastMCP) -> None:
                 resp = await hc.get(raw_url, headers={"Range": f"bytes=0-{max_chars * 2}"})
                 content_bytes = resp.content
         except Exception as e:
-            return json.dumps(
-                {"ok": False, "error": f"Failed to fetch content: {e}"},
-                ensure_ascii=False,
-            )
+            return compact_json({"ok": False, "error": f"Failed to fetch content: {e}"})
 
         # Try to decode as text
         try:
@@ -414,14 +463,13 @@ def register_advanced_tools(mcp: FastMCP) -> None:
             try:
                 text = content_bytes.decode("latin-1")
             except Exception:
-                return json.dumps(
-                    {"ok": False, "error": "File is binary — cannot preview as text."},
-                    ensure_ascii=False,
+                return compact_json(
+                    {"ok": False, "error": "File is binary — cannot preview as text."}
                 )
 
-        # Truncate
-        if len(text) > max_chars:
-            text = text[:max_chars] + "\n... (truncated)"
+        truncated = len(text) > max_chars
+        if truncated:
+            text = text[:max_chars]
 
         # Wrap in a code block for readability
         ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
@@ -443,14 +491,14 @@ def register_advanced_tools(mcp: FastMCP) -> None:
         }
         lang = lang_map.get(ext, "")
 
-        result = {
+        result: dict[str, Any] = {
             "path": path,
-            "total_bytes": len(content_bytes),
-            "preview_chars": len(text),
-            "preview": text,
-            "language": lang,
+            "content": text,
+            "truncated": truncated,
         }
-        return json.dumps(result, indent=2, ensure_ascii=False)
+        if lang:
+            result["language"] = lang
+        return compact_json(result)
 
     @mcp.tool()
     async def get_archive_extensions() -> str:
@@ -460,11 +508,13 @@ def register_advanced_tools(mcp: FastMCP) -> None:
         7z, tar.gz, etc.).
 
         Returns:
-            JSON list of supported extensions.
+            JSON object with the supported extension names.
         """
         client = await get_client()
         data = await client.request("GET", "public/archive_extensions", require_auth=False)
-        return json.dumps(data, indent=2, ensure_ascii=False)
+        return compact_json(
+            {"extensions": _stable_strings(data, ("extensions", "value", "content", "data"))}
+        )
 
     @mcp.tool()
     async def get_archive_meta(
@@ -474,8 +524,7 @@ def register_advanced_tools(mcp: FastMCP) -> None:
     ) -> str:
         """Get metadata of an archive file without extracting it.
 
-        Returns format, encryption status, comment, file structure,
-        and download URL information for the archive.
+        Returns format, encryption status, size, and modification time only.
 
         Args:
             path: Full path to the archive file (e.g. "/downloads/data.zip").
@@ -483,8 +532,7 @@ def register_advanced_tools(mcp: FastMCP) -> None:
             refresh: Whether to refresh archive cache.
 
         Returns:
-            JSON string with archive metadata including format, encryption status,
-            file tree, and direct download info.
+            JSON object containing path and optional archive metadata fields.
         """
         enforce_path_allowed(path)
 
@@ -497,7 +545,17 @@ def register_advanced_tools(mcp: FastMCP) -> None:
             body["archive_pass"] = archive_pass
 
         data = await client.request("POST", "fs/archive/meta", json=body)
-        return json.dumps(data, indent=2, ensure_ascii=False)
+        result: dict[str, Any] = {"path": path}
+        for output, fields in (
+            ("format", ("format", "type")),
+            ("encrypted", ("encrypted", "is_encrypted")),
+            ("size", ("size",)),
+            ("modified", ("modified",)),
+        ):
+            value = first_present(data, fields) if isinstance(data, Mapping) else None
+            if value is not None:
+                result[output] = value
+        return compact_json(result)
 
     @mcp.tool()
     async def decompress_archive(
@@ -522,16 +580,13 @@ def register_advanced_tools(mcp: FastMCP) -> None:
             put_into_new_dir: Whether to place extracted files in a new directory named after the archive. Defaults to false.
 
         Returns:
-            JSON string with decompression result.
+            Compact action JSON with operation, task_type, task_ids, and message.
         """
         enforce_path_allowed(src_dir)
         enforce_writable("decompress_archive")
         name_list = normalize_names(names)
         if not name_list:
-            return json.dumps(
-                {"ok": False, "error": "No archive files specified."},
-                ensure_ascii=False,
-            )
+            return compact_json({"ok": False, "error": "No archive files specified."})
 
         client = await get_client()
         body: dict[str, Any] = {
@@ -545,9 +600,8 @@ def register_advanced_tools(mcp: FastMCP) -> None:
             body["dst_dir"] = dst_dir
         if archive_pass:
             body["archive_pass"] = archive_pass
-
         data = await client.request("POST", "fs/archive/decompress", json=body)
-        return json.dumps(data, indent=2, ensure_ascii=False)
+        return compact_json(action_result(data, "decompress", task_type="decompress"))
 
     @mcp.tool()
     async def list_archive_files(
@@ -567,12 +621,12 @@ def register_advanced_tools(mcp: FastMCP) -> None:
             refresh: Whether to refresh archive cache when supported by OpenList.
 
         Returns:
-            JSON string containing archive entries.
+            JSON object with archive, inner_path, and compact entries.
         """
         enforce_path_allowed(src_dir)
         validate_name(name)
         validate_path(inner_path)
-        archive_path = posixpath.join(src_dir.rstrip("/"), name)
+        archive_path = posixpath.join(src_dir.rstrip("/") or "/", name)
         client = await get_client()
         body: dict[str, Any] = {
             "path": archive_path,
@@ -583,17 +637,24 @@ def register_advanced_tools(mcp: FastMCP) -> None:
             body["archive_pass"] = archive_pass
 
         data = await client.request("POST", "fs/archive/list", json=body)
-        return json.dumps(data, indent=2, ensure_ascii=False)
+        entries = []
+        for item in list_value(data, ("content", "value")):
+            if isinstance(item, Mapping):
+                entry = compact_file_entry(item)
+                if entry is not None:
+                    entries.append(entry)
+        return compact_json({"archive": archive_path, "inner_path": inner_path, "entries": entries})
 
     @mcp.tool()
     async def get_me() -> str:
         """Get the current authenticated user's profile information.
 
-        Returns user details including username, role, permissions, and 2FA status.
+        Returns:
+            JSON string with the compact user summary.
         """
         client = await get_client()
         data = await client.request("GET", "me")
-        return json.dumps(data, indent=2, ensure_ascii=False)
+        return compact_json(compact_user(data) if isinstance(data, Mapping) else {})
 
     @mcp.tool()
     async def logout() -> str:
@@ -617,28 +678,25 @@ def register_advanced_tools(mcp: FastMCP) -> None:
         properly set up will appear in the list.
 
         Returns:
-            JSON array of available download tool names.
+            JSON object with a tools array of available tool names.
         """
         client = await get_client()
         data = await client.request("GET", "public/offline_download_tools", require_auth=False)
-        tools = data if isinstance(data, list) else data.get("value", data.get("data", []))
-        return json.dumps(tools, ensure_ascii=False)
+        return compact_json({"tools": _download_tool_names(data)})
 
     @mcp.tool()
     async def parse_torrent(
         torrent_data: str,
     ) -> str:
-        """Parse a torrent file and return its contents (file list, metadata).
+        """Parse a torrent file and return compact metadata and file paths.
 
         Provide the torrent file content as a base64-encoded string.
-        Returns information about the torrent including file names, sizes,
-        piece count, and whether the storage backend supports rapid upload.
 
         Args:
             torrent_data: Base64-encoded content of the .torrent file.
 
         Returns:
-            JSON string with parsed torrent info including file list.
+            JSON string with compact torrent name, hash, size, and files.
         """
         client = await get_client()
         data = await client.request(
@@ -646,26 +704,25 @@ def register_advanced_tools(mcp: FastMCP) -> None:
             "fs/torrent/parse",
             json={"torrent_data": torrent_data},
         )
-        return json.dumps(data, indent=2, ensure_ascii=False)
+        return compact_json(_compact_torrent(data))
 
     @mcp.tool()
     async def torrent_upload_parse(
         torrent_data: str,
+        include_torrent_data: bool = False,
     ) -> str:
         """Upload and parse a torrent file via multipart form.
 
         Unlike parse_torrent (which sends base64 in JSON body), this sends the
-        torrent file as a multipart form upload — matching how the OpenList
-        web UI handles torrent files. The server returns parsed metadata plus
-        a base64-encoded copy of the torrent data that can be fed directly
-        into torrent_rapid_upload.
+        torrent file as a multipart form upload. The parsed metadata is compacted;
+        the returned base64 copy is included only when include_torrent_data is true.
 
         Args:
             torrent_data: Base64-encoded content of the .torrent file.
+            include_torrent_data: Include the returned base64 only when true.
 
         Returns:
-            JSON string with parsed torrent info (name, files, info_hash, etc.)
-            plus a 'torrent_data' field for reuse in rapid upload.
+            JSON string with compact torrent info; torrent_data is omitted by default.
         """
 
         client = await get_client()
@@ -677,7 +734,7 @@ def register_advanced_tools(mcp: FastMCP) -> None:
             file_name="file.torrent",
             content_type="application/x-bittorrent",
         )
-        return json.dumps(data, indent=2, ensure_ascii=False)
+        return compact_json(_compact_torrent(data, include_torrent_data))
 
     @mcp.tool()
     async def generate_torrent(
@@ -692,7 +749,7 @@ def register_advanced_tools(mcp: FastMCP) -> None:
             path: Full path to the file on OpenList (e.g. "/downloads/myfile.iso").
 
         Returns:
-            JSON string with generation result and path to the .torrent file.
+            Compact action JSON with operation, task IDs, message, and optional path.
         """
         enforce_path_allowed(path)
         enforce_writable("generate_torrent")
@@ -702,7 +759,11 @@ def register_advanced_tools(mcp: FastMCP) -> None:
             "fs/torrent/generate",
             json={"path": path},
         )
-        return json.dumps(data, indent=2, ensure_ascii=False)
+        output_path = (
+            first_present(data, ("path", "torrent_path")) if isinstance(data, Mapping) else None
+        )
+        extras = {"path": output_path} if output_path is not None else None
+        return compact_json(action_result(data, "generate_torrent", extras=extras))
 
     @mcp.tool()
     async def torrent_rapid_upload(
@@ -723,8 +784,7 @@ def register_advanced_tools(mcp: FastMCP) -> None:
             path: Destination directory path on OpenList (e.g. "/downloads").
 
         Returns:
-            JSON string with the upload/task result, or a message explaining
-            that CAS/rapid upload is not supported on this storage backend.
+            Compact action JSON with operation, task IDs, and an optional message.
         """
         enforce_writable("torrent_rapid_upload")
         enforce_path_allowed(path)
@@ -734,4 +794,4 @@ def register_advanced_tools(mcp: FastMCP) -> None:
             "fs/torrent/rapid_upload",
             json={"torrent_data": torrent_data, "path": path},
         )
-        return json.dumps(data, indent=2, ensure_ascii=False)
+        return compact_json(action_result(data, "torrent_rapid_upload"))

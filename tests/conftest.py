@@ -27,10 +27,16 @@ class ToolRecorder:
 class FakeClient:
     def __init__(self) -> None:
         self.requests = []
+        self.responses = {}
         self.uploads = []
 
     async def request(self, method: str, path: str, **kwargs):
         self.requests.append((method, path, kwargs))
+        if (method, path) in self.responses:
+            response = self.responses[(method, path)]
+            if isinstance(response, BaseException):
+                raise response
+            return response
         if path == "public/settings":
             return {"title": "OpenList Test"}
         if path == "me":
@@ -176,4 +182,24 @@ def share_tools(monkeypatch):
     from openlist_mcp.tools.share import register_share_tools
 
     register_share_tools(recorder)
+    return recorder.tools, client
+
+
+@pytest.fixture
+def auth_tools(monkeypatch):
+    recorder = ToolRecorder()
+    client = FakeClient()
+
+    async def fake_get_client():
+        return client
+
+    monkeypatch.setenv("OPENLIST_URL", "https://openlist.example")
+    monkeypatch.delenv("OPENLIST_READONLY", raising=False)
+    monkeypatch.delenv("OPENLIST_ALLOWED_PATHS", raising=False)
+    monkeypatch.setattr("openlist_mcp.config._config", None)
+    monkeypatch.setattr("openlist_mcp.tools.auth.get_client", fake_get_client)
+    from openlist_mcp.tools.auth import register_auth_tools, register_public_tools
+
+    register_auth_tools(recorder)
+    register_public_tools(recorder)
     return recorder.tools, client
