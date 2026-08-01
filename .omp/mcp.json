@@ -1,0 +1,26 @@
+{
+  "$schema": "https://raw.githubusercontent.com/can1357/oh-my-pi/main/packages/coding-agent/src/config/mcp-schema.json",
+  "mcpServers": {
+    "openlist": {
+      "type": "stdio",
+      "command": "/opt/homebrew/bin/uv",
+      "args": [
+        "run",
+        "--project",
+        "/Users/hzx/Documents/openlist-mcp-server",
+        "openlist-mcp"
+      ],
+      "cwd": "/Users/hzx/Documents/openlist-mcp-server",
+      "timeout": 120000,
+      "env": {
+        "OPENLIST_URL": "!printenv OPENLIST_URL",
+        "OPENLIST_USERNAME": "!printenv OPENLIST_USERNAME",
+        "OPENLIST_PASSWORD": "!printenv OPENLIST_PASSWORD",
+        "OPENLIST_TOTP_SECRET": "!printenv OPENLIST_TOTP_SECRET",
+        "OPENLIST_ALLOWED_PATHS": "!printenv OPENLIST_ALLOWED_PATHS",
+        "OPENLIST_SKILLS": "all",
+        "OPENLIST_READONLY": "false"
+      }
+    }
+  }
+}
