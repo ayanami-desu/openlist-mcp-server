@@ -769,8 +769,8 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "httpx", specifier = ">=0.27.0" },
-    { name = "mcp", specifier = ">=1.0.0" },
-    { name = "mcp", extras = ["cli"], marker = "extra == 'dev'", specifier = ">=1.0.0" },
+    { name = "mcp", specifier = ">=2.0.0" },
+    { name = "mcp", extras = ["cli"], marker = "extra == 'dev'", specifier = ">=2.0.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.5.0" },
     { name = "orjson", specifier = ">=3.10.0" },
     { name = "pyotp", specifier = ">=2.9.0" },

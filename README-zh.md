@@ -1,10 +1,6 @@
 # OpenList MCP Server 中文
 
 <p align="center">
-  <img src="docs/og-image.png" alt="OpenList MCP Server" width="800">
-</p>
-
-<p align="center">
   <a href="README.md">English</a> · <a href="README-zh.md">中文</a>
 </p>
 
